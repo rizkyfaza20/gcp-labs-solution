@@ -29,6 +29,12 @@ detect_project() {
   PROJECT_ID="$detected"
 }
 
+pick_region() {
+  local default="${1:-us-central1}"
+  read -r -p "GCP region [$default]: " input
+  REGION="${input:-$default}"
+}
+
 # ── Prerequisite: Install Terraform (lab's exact approach) ─────────────────
 install_terraform() {
   if command -v terraform &>/dev/null; then
@@ -107,19 +113,19 @@ module "test-vpc-module" {
     {
       subnet_name   = "subnet-01"
       subnet_ip     = "10.10.10.0/24"
-      subnet_region = "us-central1"
+      subnet_region = "$REGION"
     },
     {
       subnet_name           = "subnet-02"
       subnet_ip             = "10.10.20.0/24"
-      subnet_region         = "us-central1"
+      subnet_region         = "$REGION"
       subnet_private_access = "true"
       subnet_flow_logs      = "true"
     },
     {
       subnet_name               = "subnet-03"
       subnet_ip                 = "10.10.30.0/24"
-      subnet_region             = "us-central1"
+      subnet_region             = "$REGION"
       subnet_flow_logs          = "true"
       subnet_flow_logs_interval = "INTERVAL_10_MIN"
       subnet_flow_logs_sampling = 0.7
@@ -346,7 +352,7 @@ module "gcs-static-website-bucket" {
 
   name       = var.name
   project_id = var.project_id
-  location   = "us-central1"
+  location   = "$REGION"
 
   lifecycle_rules = [{
     action = {
@@ -420,7 +426,8 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "=== GSP751: Terraform Modules ==="
 detect_project
-echo "Project: $PROJECT_ID  |  Region: us-central1"
+pick_region
+echo "Project: $PROJECT_ID  |  Region: $REGION"
 echo
 
 install_terraform
