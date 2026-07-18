@@ -1,14 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # GSP751 - Terraform Modules: Use Registry modules & build a custom module
-# Usage: PROJECT_ID=<id> REGION=<region> bash gsp751.sh
+# Interactive mode: auto-detects PROJECT_ID, prompts for REGION, asks confirmation before each step.
 
-PROJECT_ID="${PROJECT_ID:?Must set PROJECT_ID}"
-REGION="${REGION:-us-west1}"
+confirm() {
+  local prompt="${1:-Proceed?}"
+  local reply
+  while true; do
+    read -r -p "$prompt [y/n]: " reply
+    case "$reply" in
+      [yY]) return 0 ;;
+      [nN]) echo "Skipped."; return 1 ;;
+      *) echo "Enter y or n." ;;
+    esac
+  done
+}
 
-echo "=== GSP751: Terraform Modules ==="
-echo "Project: $PROJECT_ID | Region: $REGION"
-echo
+# ── Auto-detect PROJECT_ID from gcloud ───────────────────────────────────────
+detect_project() {
+  local detected
+  detected=$(gcloud config get-value project 2>/dev/null || true)
+  if [[ -z "$detected" || "$detected" == "(unset)" ]]; then
+    echo "No project detected via gcloud."
+    read -r -p "Enter your GCP project ID: " detected
+  else
+    echo "Detected project: $detected"
+    read -r -p "Use this project? [Y/n]: " reply
+    if [[ "$reply" =~ ^[nN] ]]; then
+      read -r -p "Enter your GCP project ID: " detected
+    fi
+  fi
+  PROJECT_ID="$detected"
+}
+
+# ── Prompt for REGION ────────────────────────────────────────────────────────
+pick_region() {
+  local default="${1:-us-west1}"
+  read -r -p "GCP region [$default]: " input
+  REGION="${input:-$default}"
+}
+
+confirm_apply_destroy() {
+  local label="$1"
+  echo
+  echo "Terraform will now $label resources in project '$PROJECT_ID' region '$REGION'."
+  confirm "Run terraform $label?"
+}
 
 # ── Prerequisite: Install Terraform ──────────────────────────────────────────
 install_terraform() {
@@ -16,6 +53,7 @@ install_terraform() {
     echo "[skip] terraform already installed ($(terraform --version | head -1))"
     return
   fi
+  confirm "Terraform not found. Install it?" || return
   echo "[install] terraform..."
   wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
@@ -28,18 +66,19 @@ install_terraform() {
 task1_use_registry_module() {
   echo
   echo "═══ Task 1: Use module from Registry ═══"
+  confirm "Run Task 1 (create VPC with registry module, then destroy)?" || return
 
   local dir="$HOME/terraform-google-network"
   rm -rf "$dir"
 
-  git clone https://github.com/terraform-google-modules/terraform-google-network "$dir"
+  echo "[clone] terraform-google-network module..."
+  git clone --quiet https://github.com/terraform-google-modules/terraform-google-network "$dir"
   cd "$dir"
-  git checkout tags/v6.0.1 -b v6.0.1
+  git checkout tags/v6.0.1 -b v6.0.1 2>/dev/null
 
   local example_dir="$dir/examples/simple_project"
   cd "$example_dir"
 
-  # Patch variables.tf: set project_id default
   cat > variables.tf <<EOF
 variable "project_id" {
   description = "The project ID to host the network in"
@@ -52,7 +91,6 @@ variable "network_name" {
 }
 EOF
 
-  # Patch main.tf: use var.network_name + correct region
   cat > main.tf <<EOF
 module "test-vpc-module" {
   source       = "terraform-google-modules/network/google"
@@ -89,8 +127,18 @@ module "test-vpc-module" {
 EOF
 
   terraform init
-  terraform apply -auto-approve
-  terraform destroy -auto-approve
+
+  if confirm_apply_destroy "apply"; then
+    terraform apply -auto-approve
+  else
+    echo "[skip] Task 1 apply skipped"
+    cd "$HOME"; rm -rf "$dir"
+    return
+  fi
+
+  if confirm_apply_destroy "destroy"; then
+    terraform destroy -auto-approve
+  fi
 
   cd "$HOME"
   rm -rf "$dir"
@@ -103,6 +151,7 @@ EOF
 task2_build_module() {
   echo
   echo "═══ Task 2: Build a module ═══"
+  confirm "Run Task 2 (create GCS bucket with custom module, upload sample, then destroy)?" || return
 
   local root="$HOME/gsp751-modules"
   rm -rf "$root"
@@ -308,22 +357,23 @@ output "bucket-name" {
 }
 EOF
 
-  # ── Provision ──────────────────────────────────────────────────────────────
   terraform init
-  terraform apply -auto-approve
 
-  # ── Upload sample files ────────────────────────────────────────────────────
-  echo "[upload] sample content..."
-  cd "$root"
-  curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/master/modules/aws-s3-static-website-bucket/www/index.html > index.html
-  curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/blob/master/modules/aws-s3-static-website-bucket/www/error.html > error.html
-  gsutil cp *.html "gs://$PROJECT_ID"
+  if confirm_apply_destroy "apply"; then
+    terraform apply -auto-approve
 
-  echo "Website: https://storage.cloud.google.com/$PROJECT_ID/index.html"
+    echo "[upload] sample content..."
+    cd "$root"
+    curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/master/modules/aws-s3-static-website-bucket/www/index.html > index.html
+    curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/blob/master/modules/aws-s3-static-website-bucket/www/error.html > error.html 2>/dev/null || true
+    gsutil cp *.html "gs://$PROJECT_ID" 2>/dev/null && \
+      echo "Website: https://storage.cloud.google.com/$PROJECT_ID/index.html" || \
+      echo "[warn] gsutil upload skipped — bucket may not exist or gcloud auth issue"
 
-  # ── Clean up ───────────────────────────────────────────────────────────────
-  echo "[cleanup] destroying resources..."
-  terraform destroy -auto-approve
+    if confirm_apply_destroy "destroy"; then
+      terraform destroy -auto-approve
+    fi
+  fi
 
   cd "$HOME"
   rm -rf "$root"
@@ -333,9 +383,16 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
+echo "=== GSP751: Terraform Modules ==="
+detect_project
+pick_region "${REGION:-us-west1}"
+echo
+echo "Project: $PROJECT_ID  |  Region: $REGION"
+echo
+
 install_terraform
 task1_use_registry_module
 task2_build_module
 
 echo
-echo "=== GSP751 completed successfully ==="
+echo "=== GSP751 completed ==="
