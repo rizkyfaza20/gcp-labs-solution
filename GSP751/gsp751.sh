@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # GSP751 - Terraform Modules: Use Registry modules & build a custom module
-# Interactive mode: auto-detects PROJECT_ID, prompts for REGION, asks confirmation before each step.
+# Follows the official lab instructions exactly.
 
 confirm() {
-  local prompt="${1:-Proceed?}"
-  local reply
+  local prompt="$1" reply
   while true; do
     read -r -p "$prompt [y/n]: " reply
-    case "$reply" in
-      [yY]) return 0 ;;
-      [nN]) echo "Skipped."; return 1 ;;
-      *) echo "Enter y or n." ;;
+    case "$reply" in [yY]) return 0 ;; [nN]) echo "Skipped."; return 1 ;;
+    *) echo "Enter y or n." ;;
     esac
   done
 }
 
-# ── Auto-detect PROJECT_ID from gcloud ───────────────────────────────────────
 detect_project() {
   local detected
   detected=$(gcloud config get-value project 2>/dev/null || true)
@@ -33,52 +29,59 @@ detect_project() {
   PROJECT_ID="$detected"
 }
 
-# ── Prompt for REGION ────────────────────────────────────────────────────────
-pick_region() {
-  local default="${1:-us-west1}"
-  read -r -p "GCP region [$default]: " input
-  REGION="${input:-$default}"
-}
-
-confirm_apply_destroy() {
-  local label="$1"
-  echo
-  echo "Terraform will now $label resources in project '$PROJECT_ID' region '$REGION'."
-  confirm "Run terraform $label?"
-}
-
-# ── Prerequisite: Install Terraform ──────────────────────────────────────────
+# ── Prerequisite: Install Terraform (lab's exact approach) ─────────────────
 install_terraform() {
   if command -v terraform &>/dev/null; then
     echo "[skip] terraform already installed ($(terraform --version | head -1))"
     return
   fi
-  confirm "Terraform not found. Install it?" || return
-  echo "[install] terraform..."
-  wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-  sudo apt update && sudo apt install -y terraform
+  confirm "Terraform not found. Install it via customize_environment?" || return 0
+
+  cat <<'EOF' > ~/.customize_environment
+# Set up HashiCorp repository and install Terraform
+wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update && sudo apt install -y terraform
+EOF
+  bash ~/.customize_environment
+
+  if ! command -v terraform &>/dev/null; then
+    echo "[ERROR] Terraform install failed. Trying direct binary download as fallback..."
+    local ver="1.9.8"
+    local url="https://releases.hashicorp.com/terraform/${ver}/terraform_${ver}_linux_amd64.zip"
+    mkdir -p "$HOME/bin"
+    curl -sLo /tmp/terraform.zip "$url"
+    unzip -qo /tmp/terraform.zip -d "$HOME/bin" 2>/dev/null
+    rm -f /tmp/terraform.zip
+    chmod +x "$HOME/bin/terraform"
+    export PATH="$HOME/bin:$PATH"
+    if ! command -v terraform &>/dev/null; then
+      echo "[ERROR] terraform still not found. Exiting."
+      exit 1
+    fi
+  fi
+  echo "[ok] terraform $(terraform --version | head -1)"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Task 1: Use a module from the Registry
+# Task 1: Use modules from the Registry
 # ═══════════════════════════════════════════════════════════════════════════════
 task1_use_registry_module() {
   echo
   echo "═══ Task 1: Use module from Registry ═══"
-  confirm "Run Task 1 (create VPC with registry module, then destroy)?" || return
+  confirm "Run Task 1?" || return
 
   local dir="$HOME/terraform-google-network"
   rm -rf "$dir"
 
-  echo "[clone] terraform-google-network module..."
-  git clone --quiet https://github.com/terraform-google-modules/terraform-google-network "$dir"
+  echo "Cloning terraform-google-network..."
+  git clone https://github.com/terraform-google-modules/terraform-google-network "$dir"
   cd "$dir"
-  git checkout tags/v6.0.1 -b v6.0.1 2>/dev/null
+  git checkout tags/v6.0.1 -b v6.0.1
 
-  local example_dir="$dir/examples/simple_project"
-  cd "$example_dir"
+  cd "$dir/examples/simple_project"
 
+  # ── Update variables.tf ──────────────────────────────────────────────────
   cat > variables.tf <<EOF
 variable "project_id" {
   description = "The project ID to host the network in"
@@ -91,6 +94,7 @@ variable "network_name" {
 }
 EOF
 
+  # ── Update main.tf ───────────────────────────────────────────────────────
   cat > main.tf <<EOF
 module "test-vpc-module" {
   source       = "terraform-google-modules/network/google"
@@ -103,19 +107,19 @@ module "test-vpc-module" {
     {
       subnet_name   = "subnet-01"
       subnet_ip     = "10.10.10.0/24"
-      subnet_region = "$REGION"
+      subnet_region = "us-central1"
     },
     {
       subnet_name           = "subnet-02"
       subnet_ip             = "10.10.20.0/24"
-      subnet_region         = "$REGION"
+      subnet_region         = "us-central1"
       subnet_private_access = "true"
       subnet_flow_logs      = "true"
     },
     {
       subnet_name               = "subnet-03"
       subnet_ip                 = "10.10.30.0/24"
-      subnet_region             = "$REGION"
+      subnet_region             = "us-central1"
       subnet_flow_logs          = "true"
       subnet_flow_logs_interval = "INTERVAL_10_MIN"
       subnet_flow_logs_sampling = 0.7
@@ -127,18 +131,10 @@ module "test-vpc-module" {
 EOF
 
   terraform init
-
-  if confirm_apply_destroy "apply"; then
-    terraform apply -auto-approve
-  else
-    echo "[skip] Task 1 apply skipped"
-    cd "$HOME"; rm -rf "$dir"
-    return
-  fi
-
-  if confirm_apply_destroy "destroy"; then
-    terraform destroy -auto-approve
-  fi
+  echo
+  confirm "Run terraform apply?" && terraform apply -auto-approve
+  echo
+  confirm "Run terraform destroy?" && terraform destroy -auto-approve
 
   cd "$HOME"
   rm -rf "$dir"
@@ -151,20 +147,33 @@ EOF
 task2_build_module() {
   echo
   echo "═══ Task 2: Build a module ═══"
-  confirm "Run Task 2 (create GCS bucket with custom module, upload sample, then destroy)?" || return
+  confirm "Run Task 2?" || return
 
-  local root="$HOME/gsp751-modules"
-  rm -rf "$root"
-  mkdir -p "$root/modules/gcs-static-website-bucket"
-  cd "$root"
+  # Save any existing files to restore later
+  local backup_dir
+  backup_dir="$(mktemp -d)"
+  for f in main.tf variables.tf outputs.tf; do
+    [[ -f "$HOME/$f" ]] && cp "$HOME/$f" "$backup_dir/"
+  done
+  [[ -d "$HOME/modules" ]] && cp -r "$HOME/modules" "$backup_dir/" 2>/dev/null || true
 
-  # ── Module files ───────────────────────────────────────────────────────────
-  cat > modules/gcs-static-website-bucket/README.md <<EOF
+  cd "$HOME"
+
+  # ── Create root main.tf and module directory ─────────────────────────────
+  touch main.tf
+  mkdir -p modules/gcs-static-website-bucket
+  cd modules/gcs-static-website-bucket
+  touch website.tf variables.tf outputs.tf
+
+  # ── README.md ────────────────────────────────────────────────────────────
+  tee -a README.md <<EOF
 # GCS static website bucket
+
 This module provisions Cloud Storage buckets configured for static website hosting.
 EOF
 
-  cat > modules/gcs-static-website-bucket/LICENSE <<EOF
+  # ── LICENSE ──────────────────────────────────────────────────────────────
+  tee -a LICENSE <<EOF
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -178,7 +187,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 EOF
 
-  cat > modules/gcs-static-website-bucket/website.tf <<'TFEOF'
+  # ── website.tf ───────────────────────────────────────────────────────────
+  cat > website.tf <<'TFEOF'
 resource "google_storage_bucket" "bucket" {
   name               = var.name
   project            = var.project_id
@@ -226,7 +236,8 @@ resource "google_storage_bucket" "bucket" {
 }
 TFEOF
 
-  cat > modules/gcs-static-website-bucket/variables.tf <<'TFEOF'
+  # ── variables.tf (module) ────────────────────────────────────────────────
+  cat > variables.tf <<'TFEOF'
 variable "name" {
   description = "The name of the bucket."
   type        = string
@@ -253,6 +264,7 @@ variable "labels" {
   type        = map(string)
   default     = null
 }
+
 
 variable "bucket_policy_only" {
   description = "Enables Bucket Policy Only access to a bucket."
@@ -301,28 +313,40 @@ variable "encryption" {
 variable "lifecycle_rules" {
   description = "The bucket's Lifecycle Rules configuration."
   type = list(object({
-    action    = any
+    # Object with keys:
+    # - type - The type of the action of this Lifecycle Rule. Supported values: Delete and SetStorageClass.
+    # - storage_class - (Required if action type is SetStorageClass) The target Storage Class of objects affected by this Lifecycle Rule.
+    action = any
+
+    # Object with keys:
+    # - age - (Optional) Minimum age of an object in days to satisfy this condition.
+    # - created_before - (Optional) Creation date of an object in RFC 3339 (e.g. 2017-06-13) to satisfy this condition.
+    # - with_state - (Optional) Match to live and/or archived objects. Supported values include: "LIVE", "ARCHIVED", "ANY".
+    # - matches_storage_class - (Optional) Storage Class of objects to satisfy this condition. Supported values include: MULTI_REGIONAL, REGIONAL, NEARLINE, COLDLINE, STANDARD, DURABLE_REDUCED_AVAILABILITY.
+    # - num_newer_versions - (Optional) Relevant only for versioned objects. The number of newer versions of an object to satisfy this condition.
     condition = any
   }))
   default = []
 }
 TFEOF
 
-  cat > modules/gcs-static-website-bucket/outputs.tf <<'TFEOF'
+  # ── outputs.tf (module) ──────────────────────────────────────────────────
+  cat > outputs.tf <<'TFEOF'
 output "bucket" {
   description = "The created storage bucket"
   value       = google_storage_bucket.bucket
 }
 TFEOF
 
-  # ── Root module files ──────────────────────────────────────────────────────
+  # ── Root main.tf ─────────────────────────────────────────────────────────
+  cd "$HOME"
   cat > main.tf <<EOF
 module "gcs-static-website-bucket" {
   source = "./modules/gcs-static-website-bucket"
 
   name       = var.name
   project_id = var.project_id
-  location   = "$REGION"
+  location   = "us-central1"
 
   lifecycle_rules = [{
     action = {
@@ -336,6 +360,15 @@ module "gcs-static-website-bucket" {
 }
 EOF
 
+  # ── Root outputs.tf ──────────────────────────────────────────────────────
+  cat > outputs.tf <<'EOF'
+output "bucket-name" {
+  description = "Bucket names."
+  value       = "module.gcs-static-website-bucket.bucket"
+}
+EOF
+
+  # ── Root variables.tf ────────────────────────────────────────────────────
   cat > variables.tf <<EOF
 variable "project_id" {
   description = "The ID of the project in which to provision resources."
@@ -350,33 +383,35 @@ variable "name" {
 }
 EOF
 
-  cat > outputs.tf <<'EOF'
-output "bucket-name" {
-  description = "Bucket names."
-  value       = "module.gcs-static-website-bucket.bucket"
-}
-EOF
-
+  # ── Provision ────────────────────────────────────────────────────────────
   terraform init
+  echo
+  confirm "Run terraform apply?" && terraform apply -auto-approve
 
-  if confirm_apply_destroy "apply"; then
-    terraform apply -auto-approve
-
-    echo "[upload] sample content..."
-    cd "$root"
+  # ── Upload sample files ──────────────────────────────────────────────────
+  if confirm "Upload sample index.html and error.html to the bucket?"; then
+    cd "$HOME"
     curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/master/modules/aws-s3-static-website-bucket/www/index.html > index.html
-    curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/blob/master/modules/aws-s3-static-website-bucket/www/error.html > error.html 2>/dev/null || true
-    gsutil cp *.html "gs://$PROJECT_ID" 2>/dev/null && \
-      echo "Website: https://storage.cloud.google.com/$PROJECT_ID/index.html" || \
-      echo "[warn] gsutil upload skipped — bucket may not exist or gcloud auth issue"
-
-    if confirm_apply_destroy "destroy"; then
-      terraform destroy -auto-approve
-    fi
+    curl -s https://raw.githubusercontent.com/hashicorp/learn-terraform-modules/blob/master/modules/aws-s3-static-website-bucket/www/error.html > error.html
+    gsutil cp *.html "gs://$PROJECT_ID"
+    echo "Website: https://storage.cloud.google.com/$PROJECT_ID/index.html"
   fi
 
+  # ── Destroy ──────────────────────────────────────────────────────────────
+  echo
+  confirm "Run terraform destroy?" && terraform destroy -auto-approve
+
+  # ── Clean up created files ───────────────────────────────────────────────
   cd "$HOME"
-  rm -rf "$root"
+  rm -f main.tf variables.tf outputs.tf index.html error.html
+  rm -rf modules
+  # Restore any pre-existing files
+  for f in main.tf variables.tf outputs.tf; do
+    [[ -f "$backup_dir/$f" ]] && cp "$backup_dir/$f" "$HOME/"
+  done
+  [[ -d "$backup_dir/modules" ]] && cp -r "$backup_dir/modules" "$HOME/" 2>/dev/null || true
+  rm -rf "$backup_dir"
+
   echo "[done] Task 2 complete"
 }
 
@@ -385,9 +420,7 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "=== GSP751: Terraform Modules ==="
 detect_project
-pick_region "${REGION:-us-west1}"
-echo
-echo "Project: $PROJECT_ID  |  Region: $REGION"
+echo "Project: $PROJECT_ID  |  Region: us-central1"
 echo
 
 install_terraform
